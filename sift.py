@@ -32,7 +32,15 @@ class Utility:
         """
         if len(point) == 3:
             x, y, z = point
-            dx = matrix[x + 1, y, z] - matrix[x - 1, y, z]
+            if x + 1 >= matrix.shape[0]:
+                x_left = matrix[x, y, z]
+            else:
+                x_left = matrix[x + 1, y, z]
+            if x - 1 < 0:
+                x_right = matrix[x, y, z]
+            else:
+                x_right = matrix[x - 1, y, z]
+            dx = x_left - x_right
             dy = matrix[x, y + 1, z] - matrix[x, y - 1, z]
             dz = matrix[x, y, z + 1] - matrix[x, y, z - 1]
             return np.array([dx, dy, dz])
@@ -46,32 +54,35 @@ class Utility:
             raise ValueError("point must be a tuple or list of length 2 or 3")
 
     def hessian(self, matrix: np.array, point: tuple) -> np.array:
-        gradientx = np.zeros((len(point), len(point)))
-        gradienty = np.zeros((len(point), len(point)))
+
         if len(point) == 3:
             a, b, c = matrix.shape
-            assert a == b == c == 5
-            gradientz = np.zeros((len(point), len(point)))
+            assert b == c == 5, f'Matrix must be 5x5, not {a}x{b}x{c}'
+            gradientx = np.zeros((len(point), len(point), len(point)))
+            gradienty = np.zeros((len(point), len(point), len(point)))
+            gradientz = np.zeros((len(point), len(point), len(point)))
             for i in range(1, 4):
                 for j in range(1, 4):
                     for k in range(1, 4):
                         dx, dy, dz = self.derivative(matrix, (i, j, k))
-                        gradientx[i, j] = dx
-                        gradienty[i, j] = dy
-                        gradientz[i, j] = dz
+                        gradientx[i - 1, j - 1, k - 1] = dx
+                        gradienty[i - 1, j - 1, k - 1] = dy
+                        gradientz[i - 1, j - 1, k - 1] = dz
         elif len(point) == 2:
+            gradientx = np.zeros((3, 3))
+            gradienty = np.zeros((3, 3))
             a, b = matrix.shape
             assert a == b == 5
             for i in range(1, 4):
                 for j in range(1, 4):
                     dx, dy = self.derivative(matrix, (i, j))
-                    gradientx[i, j] = dx
-                    gradienty[i, j] = dy
+                    gradientx[i - 1, j - 1] = dx
+                    gradienty[i - 1, j - 1] = dy
 
         if len(point) == 3:
-            dxx, dxy, dxz = self.derivative(gradientx, (1, 1))
-            dyx, dyy, dyz = self.derivative(gradienty, (1, 1))
-            dzx, dzy, dzz = self.derivative(gradientz, (1, 1))
+            dxx, dxy, dxz = self.derivative(gradientx, (1, 1, 1))
+            dyx, dyy, dyz = self.derivative(gradienty, (1, 1, 1))
+            dzx, dzy, dzz = self.derivative(gradientz, (1, 1, 1))
             hessian = np.array([
                 [dxx, dxy, dxz],
                 [dyx, dyy, dyz],
@@ -97,7 +108,8 @@ class SIFT:
         Returns:
             kp: list of keypoints
         """
-        HEIGH, WIDTH, _channels = map(int, src.shape)
+        util = Utility()
+        HEIGH, WIDTH = map(int, img.shape)
 
         K = np.sqrt(2)  # as suggested [Lowe 2004]
         SIGMA = 1.6  # as suggested [Lowe 2004]
@@ -115,11 +127,12 @@ class SIFT:
         pyramids = []
         for octave in range(N_OCTAVES):
             if octave > 0:
+                height, width = src.shape
                 src = cv.pyrDown(
                     src,
                     dstsize=(
-                        WIDTH // DOWN_SAMPLING_FACTOR,
-                        HEIGH // DOWN_SAMPLING_FACTOR,
+                        width // DOWN_SAMPLING_FACTOR,
+                        height // DOWN_SAMPLING_FACTOR,
                     ),
                 )
             pyramid = []
@@ -145,10 +158,33 @@ class SIFT:
         window = 3
         step = 1
         for octave in range(N_OCTAVES):
+            print('octave', octave)
             for z in range((SCALE_LEVEL - 1) - window + step):
+                print('z', z)
                 scale = SIGMA * (K**z)
-                for h in range(HEIGH // DOWN_SAMPLING_FACTOR**z - window):
-                    for w in range(WIDTH // DOWN_SAMPLING_FACTOR**z - window):
+                # 5. Orientation assignment
+                L = (
+                    pyramids[octave][z] / scale
+                )  # should now be scale invariant
+                gradients_mag = np.zeros(L.shape)
+                orientations = np.zeros(L.shape)
+                for h in range(1, L.shape[0] - window):
+                    for w in range(1, L.shape[1] - window):
+                        m = np.sqrt(
+                            (L[h, w + 1] - L[h, w - 1]) ** 2
+                            + (L[h + 1, w] - L[h - 1, w]) ** 2
+                        )
+                        theta = np.arctan2(
+                            L[h + 1, w] - L[h - 1, w],
+                            L[h, w + 1] - L[h, w - 1],
+                        )
+                        gradients_mag[h, w] = m
+                        orientations[h, w] = (
+                            theta + 2 * np.pi if theta < 0 else theta
+                        )  # [0, 2pi]
+                print('orientations', orientations.shape)
+                for h in range(8, HEIGH // DOWN_SAMPLING_FACTOR**z - window - 3):
+                    for w in range(8, WIDTH // DOWN_SAMPLING_FACTOR**z - window - 3):
                         # TODO scale image to the original size
                         neighborhood = difference_of_gaussians[octave][
                             z : z + window, h : h + window, w : w + window
@@ -156,17 +192,20 @@ class SIFT:
                         neighborhoodH = difference_of_gaussians[octave][
                             z : z + 5, h : h + 5, w : w + 5
                         ]
+                        if neighborhoodH.shape[1:] != (5, 5) or neighborhood.shape[0] < 4:
+                            continue
                         if neighborhood[1, 1, 1] == np.max(neighborhood, axis=None):
                             x = np.array([h + 1, w + 1, z])
 
                             # 4. Accurate keypoint localization
                             middle_coor = (1, 1, 1)
                             middle_coorH = (2, 2, 2)
-                            gradient = Utility.derivative(neighborhood, middle_coor)
-                            hessian = Utility.hessian(
+                            gradient = util.derivative(matrix=neighborhood, point=middle_coor)
+                            hessian = util.hessian(
                                 neighborhoodH,
                                 middle_coorH
                             )
+                            hessian += np.eye(3) * 0.000001
                             offset = -np.linalg.inv(hessian) @ gradient
                             response = neighborhood[1, 1, 1] + 0.5 * np.inner(
                                 gradient, offset
@@ -175,9 +214,10 @@ class SIFT:
                                 continue
 
                             # 4.1 Eliminating edge responses
-                            hessian2D = Utility.hessian(
-                                neighborhoodH[:, :, 2], middle_coorH[:2]
+                            hessian2D = util.hessian(
+                                neighborhoodH[2, :, :], middle_coorH[:2]
                             )
+                            hessian2D += np.eye(2) * 0.000001
                             tr_hessian2D = np.trace(hessian2D)
                             det_hessian2D = np.linalg.det(hessian2D)
                             if (
@@ -187,28 +227,7 @@ class SIFT:
                             ):
                                 continue
 
-                            # 5. Orientation assignment
-                            L = (
-                                pyramids[octave][z] / scale
-                            )  # should now be scale invariant
-                            gradients = np.zeros(L.shape)
-                            orientations = np.zeros(L.shape)
-                            for h in range(HEIGH // DOWN_SAMPLING_FACTOR**z - window):
-                                for w in range(
-                                    WIDTH // DOWN_SAMPLING_FACTOR**z - window
-                                ):
-                                    m = np.sqrt(
-                                        (L[h, w + 1] - L[h, w - 1]) ** 2
-                                        + (L[h + 1, w] - L[h - 1, w]) ** 2
-                                    )
-                                    theta = np.arctan2(
-                                        L[h + 1, w] - L[h - 1, w],
-                                        L[h, w + 1] - L[h, w - 1],
-                                    )
-                                    gradients[h, w] = m
-                                    orientations[h, w] = (
-                                        theta + 2 * np.pi if theta < 0 else theta
-                                    )  # [0, 2pi]
+
                             histogram = np.histogram(orientations, bins=36, range=(0, 2 * np.pi))[0]
                             principle_orientation = np.argmax(histogram)
                             principle_orientation = 10 * principle_orientation
@@ -217,28 +236,42 @@ class SIFT:
                             ksize = 16
                             ksize = np.around(ksize, decimals=0)
                             # apply Gaussian window to gradients and orientations
-                            g = cv.GaussianBlur(
-                                gradients[
+                            grad_mag = gradients_mag[
                                     h - ksize // 2 : h + ksize // 2,
                                     w - ksize // 2 : w + ksize // 2,
-                                ],
+                                ]
+                            orie = orientations[
+                                    h - ksize // 2 : h + ksize // 2,
+                                    w - ksize // 2 : w + ksize // 2,
+                                ]
+                            grad_mag = cv.GaussianBlur(
+                                grad_mag,
                                 ksize=(ksize + 1, ksize + 1),
+                                sigmaX=0, # calculate sigmaX from kernel size
+                                sigmaY=0, # calculate sigmaY from kernel size
                             )
-                            g = g[1:, 1:]
+                            orie = cv.GaussianBlur(
+                                orie,
+                                ksize=(ksize + 1, ksize + 1),
+                                sigmaX=0, # calculate sigmaX from kernel size
+                                sigmaY=0, # calculate sigmaY from kernel size
+                            )
+                            grad_mag = grad_mag[1:, 1:]
+                            orie = orie[1:, 1:]
                             descriptor = []
                             for i in range(4):
                                 for j in range(4):
                                     r = i * ksize // 4
                                     c = j * ksize // 4
                                     o = np.histogram(
-                                        g[
+                                        orie[
                                             r : r + ksize // 4,
                                             c : c + ksize // 4,
                                         ],
                                         bins=8,
                                         range=(0, 2 * np.pi),
                                     )[0]
-                                    descriptor += o
+                                    descriptor = np.concatenate((descriptor, o))
                             descriptor = np.array(descriptor) # 4x4x8
                             descriptor = descriptor / np.linalg.norm(descriptor) # normalize to unit length
                             descriptor = np.clip(descriptor, a_min=0, a_max=0.2) # clip to [0, 0.2] as suggested in by Lowe 2004
@@ -249,4 +282,13 @@ class SIFT:
                             des.append(descriptor)
 
 
-        return kps, des
+        return np.array(kps), np.array(des)
+
+
+sift = SIFT()
+img = cv.imread('imgg.jpg')
+gray = cv.cvtColor(img,cv.COLOR_BGR2GRAY)
+kp, des = sift.detect(gray)
+print(kp.shape, des.shape)
+img = cv.drawKeypoints(gray, kp, img,flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+cv.imwrite('sift_keypoints.jpg',img)
